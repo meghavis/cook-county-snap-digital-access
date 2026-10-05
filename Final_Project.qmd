@@ -1,0 +1,504 @@
+---
+title: "Digital Access and SNAP Enrollment Gaps in Cook County"
+author: "Megha Viswanath"
+date: today
+format:
+  html:
+    embed-resources: true
+    code-fold: true
+    toc: true
+    toc-float: true
+---
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = "~/Desktop/DAP/Final_Project")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+
+```{r}
+library(tidyverse)
+library(sf)
+library(tidycensus)
+library(tigris)
+library(rgeoda)
+library(spdep)
+library(spatialreg)
+library(leaflet)
+library(gt)
+
+options(tigris_use_cache = TRUE)
+```
+
+This project examines whether limited internet access helps explain 
+why some Cook County census tracts have lower SNAP enrollment than 
+their poverty levels would predict. It combines ACS data on SNAP 
+receipt, poverty, and internet access with Chicago Public Library 
+branch locations to test whether digital infrastructure gaps 
+function as barriers to benefits enrollment.
+
+## My Research Question:
+Do Cook County neighborhoods with low internet access show lower 
+SNAP enrollment than expected given their poverty levels, and does 
+proximity to a public library (as a fallback source of internet 
+access) help close that gap?
+
+## Data Sources
+This analysis uses three data sources. The first is the American 
+Community Survey (ACS) 2022 5-year estimates, accessed via the 
+Census API in R. Table B22003 provides household-level counts of 
+SNAP receipt cross-tabulated with poverty status, allowing both the 
+SNAP enrollment rate and the poverty rate to be derived from the 
+same table using the same unit (households). Table B28002 provides 
+household-level internet subscription status, from which the share 
+of households with no internet access is calculated. The second 
+source is tract boundary polygons from the Census TIGER/Line files, 
+downloaded through the tigris R package. The third is Chicago Public 
+Library branch locations, published as a GeoJSON file on the Chicago 
+Open Data Portal.
+
+## Import
+
+```{r import-acs-data}
+cook_tracts <- get_acs(
+  geography = "tract",
+  state = "IL",
+  county = "Cook",
+  variables = c(
+    total_hh        = "B22003_001",
+    snap_hh         = "B22003_002",
+    snap_poverty    = "B22003_003",
+    no_snap_poverty = "B22003_006",
+    total_hh_internet = "B28002_001",
+    no_internet     = "B28002_013"
+  ),
+  year = 2022,
+  survey = "acs5",
+  output = "wide",
+  geometry = TRUE
+)
+```
+
+## Data Cleaning
+The raw ACS counts are converted into rates so tracts of different 
+sizes can be compared. The SNAP enrollment rate is the share of 
+households receiving SNAP. The poverty rate is derived by summing 
+households below poverty that received SNAP (B22003_003) with 
+households below poverty that did not receive SNAP (B22003_006), 
+then dividing by total households. Using the same table for both 
+rates avoids a unit mismatch between household-level and 
+individual-level counts. The no-internet rate is the share of 
+households with no internet access of any kind. Tracts with zero 
+households are removed to avoid division errors.
+
+```{r}
+cook_tracts <- cook_tracts |>
+  mutate(
+    poverty_hh = snap_povertyE + no_snap_povertyE,
+    snap_rate = snap_hhE / total_hhE,
+    poverty_rate = poverty_hh / total_hhE,
+    no_internet_rate = no_internetE / total_hh_internetE
+  ) |>
+  filter(total_hhE > 0)
+```
+
+All spatial data is reprojected to EPSG 6455 (NAD83(2011) / Illinois 
+East) to minimize distance distortion for the study area.
+
+```{r}
+cook_tracts <- cook_tracts |>
+  st_transform(6455)
+```
+
+Chicago Public Library branch locations are downloaded from the 
+Chicago Open Data Portal as a GeoJSON file. These represent the 
+locations where residents without home internet can access free 
+computers and wifi.
+
+```{r}
+libraries <- st_read("https://data.cityofchicago.org/resource/x8fc-8rcq.geojson") |>
+  st_transform(6455)
+```
+Cook County contains 1,332 census tracts, but Chicago Public Library 
+branches serve only the City of Chicago. To ensure the library 
+distance variable is meaningful, the analysis is limited to tracts 
+within Chicago's municipal boundary.
+
+```{r}
+chicago_boundary <- places(state = "IL", year = 2022) |>
+  filter(NAME == "Chicago") |>
+  st_transform(6455)
+
+chicago_tracts <- cook_tracts |>
+  st_filter(chicago_boundary)
+```
+
+```{r}
+saveRDS(chicago_tracts, "data/chicago_tracts.rds")
+saveRDS(libraries, "data/libraries.rds")
+saveRDS(chicago_boundary, "data/chicago_boundary.rds")
+```
+
+To measure each tract's access to library-based internet, the 
+distance from each tract's geographic centroid to the nearest 
+Chicago Public Library branch is calculated using sf spatial 
+functions. Centroids approximate where the population of a tract is 
+located, and the nearest-feature function identifies which library 
+branch is closest to each tract.
+
+```{r}
+tract_centroids <- chicago_tracts |>
+  st_centroid()
+```
+
+```{r}
+nearest_index <- st_nearest_feature(tract_centroids, libraries)
+
+tract_centroids$nearest_library <- libraries$branch_[nearest_index]
+
+tract_centroids$library_dist_ft <- as.numeric(
+  st_distance(tract_centroids, libraries[nearest_index, ], by_element = TRUE)
+)
+
+tract_centroids$library_dist_mi <- tract_centroids$library_dist_ft / 5280
+```
+
+```{r}
+chicago_tracts <- chicago_tracts |>
+  mutate(
+    library_dist_mi = tract_centroids$library_dist_mi,
+    nearest_library = tract_centroids$nearest_library
+  )
+```
+
+## Geosptial Analysis
+### Regression Analysis
+
+The first step is a baseline OLS regression predicting the SNAP 
+enrollment rate from the poverty rate alone. If poverty were the 
+only factor driving SNAP enrollment, this model would explain most 
+of the variation. The residuals (tracts where the model over- or 
+under-predicts) reveal where something other than poverty is 
+affecting enrollment.
+
+```{r}
+chicago_tracts <- chicago_tracts |>
+  filter(!is.na(snap_rate), !is.na(poverty_rate), !is.na(no_internet_rate))
+
+ols_1 <- lm(snap_rate ~ poverty_rate, data = chicago_tracts)
+summary(ols_1)
+```
+
+```{r}
+chicago_tracts$ols1_residual <- residuals(ols_1)
+```
+
+To determine whether a spatial model is appropriate, Global 
+Moran's I is calculated on the OLS residuals. If the residuals 
+show significant spatial clustering, it means the model is missing 
+a spatially structured variable, and a spatial regression should be 
+used. 
+
+```{r}
+nb <- poly2nb(chicago_tracts, queen = TRUE)
+listw <- nb2listw(nb, style = "W")
+```
+
+```{r}
+moran.test(chicago_tracts$ols1_residual, listw)
+```
+Moran's I = 0.276, p-value < 2.2e-16. The residuals are significantly spatially clustered. Tracts where SNAP enrollment is lower than expected aren't scattered randomly across Chicago but concentrated in specific areas. This means the poverty-only model is missing something that has a geographic pattern.
+
+Adding the share of households with no internet access tests 
+whether digital connectivity helps explain the SNAP enrollment 
+gap that poverty alone cannot.
+
+```{r}
+ols_2 <- lm(snap_rate ~ poverty_rate + no_internet_rate, data = chicago_tracts)
+summary(ols_2)
+```
+R² went from 0.667 to 0.695 which means internet access adds about 3 percentage points of explanatory power and the coefficient is highly significant (p < 2e-16).The coefficient on no_internet_rate is positive (0.391). 
+
+The coefficient on no-internet rate is positive, meaning tracts with less internet access have higher SNAP enrollment after controlling for poverty. This runs counter to the initial hypothesis. The likely explanation is that no-internet tracts represent the deepest concentrations of disadvantage, where in-person enrollment infrastructure (caseworkers, community organizations, social service agencies) is already active. At the individual level, lacking internet may still be a barrier, but at the tract level,this effect is overwhelmed by other dimensions of need that drive enrollment through non-digital channels.
+
+
+Adding distance to the nearest library branch tests whether 
+physical access to free public internet infrastructure has an 
+additional relationship with SNAP enrollment beyond what poverty 
+and home internet access explain.
+
+```{r}
+ols_3 <- lm(snap_rate ~ poverty_rate + no_internet_rate + library_dist_mi, 
+            data = chicago_tracts)
+summary(ols_3)
+```
+Library distance is not significant. The coefficient is -0.003, p = 0.568, and R² didn't budge (0.6954 → 0.6955). Being closer to or farther from a library seems to have no detectable relationship with SNAP enrollment after accounting for poverty and internet access.
+
+The Global Moran's I test on the baseline OLS residuals returned a 
+statistic of 0.276 (p < 2.2e-16), confirming significant spatial 
+clustering. This means the OLS models are missing a spatially 
+structured variable. The spatial error model accounts for this by 
+modeling the correlation between neighboring tracts' error terms, 
+estimating what the residual pattern would look like if the missing 
+variable were included. AIC is used to compare all models — lower 
+AIC indicates a better fit.
+
+```{r}
+sem <- errorsarlm(snap_rate ~ poverty_rate + no_internet_rate + library_dist_mi, 
+                  data = chicago_tracts, 
+                  listw = listw)
+summary(sem)
+```
+The spatial error model shows strong evidence of spatial clustering in the data. Lambda is large and highly significant, meaning that SNAP enrollment patterns are still shaped by geographic factors not fully captured by the variables in the model. In other words, neighboring tracts are similar in ways the model does not directly measure, such as language barriers, housing instability, outreach networks, or awareness of benefits.
+The spatial error model also fits the data much better than the OLS model. Its AIC is much lower, dropping from -1664.3 to -1824.5, which suggests that accounting for spatial dependence improves the model substantially.
+
+After accounting for this spatial structure, the effect of internet access becomes smaller but remains statistically significant. This suggests that the original OLS model may have overstated the role of internet access because part of that effect was really due to spatial clustering. Still, internet access appears to matter for SNAP enrollment.
+
+Library distance remains statistically insignificant, meaning there is still no clear evidence that proximity to libraries predicts SNAP enrollment in this model.
+
+
+
+## Results
+### Model Comparison
+The table below compares AIC across all four models. The spatial 
+error model provides the best fit, confirming that SNAP enrollment 
+patterns in Chicago have a spatial structure that OLS cannot capture. 
+Internet access remains a significant predictor in every model 
+specification, while library distance does not.
+```{r}
+model_comparison <- tibble(
+  Model = c(
+    "OLS: Poverty only",
+    "OLS: Poverty + Internet",
+    "OLS: Poverty + Internet + Library Distance",
+    "Spatial Error: Poverty + Internet + Library Distance"
+  ),
+  R_squared = c(
+    summary(ols_1)$r.squared,
+    summary(ols_2)$r.squared,
+    summary(ols_3)$r.squared,
+    NA
+  ),
+  AIC = c(
+    AIC(ols_1),
+    AIC(ols_2),
+    AIC(ols_3),
+    AIC(sem)
+  )
+)
+
+model_comparison |>
+  gt() |>
+  fmt_number(columns = R_squared, decimals = 4) |>
+  fmt_number(columns = AIC, decimals = 1) |>
+  sub_missing(missing_text = "—") |>
+  cols_label(
+    R_squared = "R²",
+    AIC = "AIC"
+  )
+```
+The baseline OLS model using poverty alone explains 66.7% of the 
+variation in SNAP enrollment. Adding internet access raises R² to 
+69.5%, and the no-internet rate is highly significant across all 
+model specifications. Library distance has no significant 
+relationship with SNAP enrollment in any model. The spatial error 
+model produces the lowest AIC (-1824.5 vs. -1664.3 for the best 
+OLS), confirming that spatially clustered factors beyond poverty, 
+internet access, and library proximity are influencing SNAP 
+enrollment patterns. The large, significant lambda (0.676) 
+suggests unmeasured neighborhood-level factors, such as language 
+barriers, housing instability, or the presence of community 
+organizations that assist with enrollment, are shaping who enrolls.
+
+## Maps
+
+### SNAP Enrollment Rate by Tract
+
+The map below shows the share of households receiving SNAP in each 
+Chicago census tract. Darker areas indicate higher enrollment. The 
+south and west sides of Chicago show the highest rates, consistent 
+with known patterns of concentrated poverty.
+
+```{r}
+snap_pal <- colorNumeric(palette = "YlOrRd", domain = chicago_tracts$snap_rate)
+
+leaflet(chicago_tracts |> st_transform(4326)) |>
+  addProviderTiles("CartoDB.Positron") |>
+  addPolygons(
+    fillColor = ~snap_pal(snap_rate),
+    fillOpacity = 0.7,
+    color = "white",
+    weight = 0.5,
+    popup = ~paste0(
+      "<b>Tract: </b>", GEOID, "<br>",
+      "<b>SNAP Rate: </b>", round(snap_rate * 100, 1), "%"
+    )
+  ) |>
+  addLegend(
+    position = "bottomright",
+    pal = snap_pal,
+    values = ~snap_rate,
+    title = "SNAP Rate",
+    labFormat = labelFormat(transform = function(x) round(x * 100, 0), suffix = "%")
+  )
+```
+### SNAP Enrollment vs. Expected
+
+This map shows where SNAP enrollment deviates from what poverty 
+levels alone would predict. Blue tracts have lower enrollment than 
+expected which signals that something beyond poverty is suppressing enrollment in 
+those areas. Red tracts have higher enrollment than expected. The 
+north side of Chicago shows several clusters of under-enrollment 
+relative to poverty.
+
+```{r}
+resid_pal <- colorNumeric(
+  palette = "RdBu",
+  domain = chicago_tracts$ols1_residual,
+  reverse = TRUE
+)
+
+leaflet(chicago_tracts |> st_transform(4326)) |>
+  addProviderTiles("CartoDB.Positron") |>
+  addPolygons(
+    fillColor = ~resid_pal(ols1_residual),
+    fillOpacity = 0.7,
+    color = "white",
+    weight = 0.5,
+    popup = ~paste0(
+      "<b>Tract: </b>", GEOID, "<br>",
+      "<b>SNAP Rate: </b>", round(snap_rate * 100, 1), "%<br>",
+      "<b>Poverty Rate: </b>", round(poverty_rate * 100, 1), "%<br>",
+      "<b>Gap: </b>", 
+      ifelse(ols1_residual < 0, 
+             paste0(round(abs(ols1_residual) * 100, 1), "% lower than expected"),
+             paste0(round(ols1_residual * 100, 1), "% higher than expected"))
+    )
+  ) |>
+  addLegend(
+    position = "bottomright",
+    pal = resid_pal,
+    values = ~ols1_residual,
+    title = "SNAP Enrollment<br>vs. Expected",
+    labFormat = labelFormat(
+      transform = function(x) round(x * 100, 0),
+      suffix = "%"
+    )
+  ) |>
+  addControl(
+    html = "<div style='background:white; padding:8px; font-size:12px; border-radius:4px;'>
+            <span style='color:#2166AC;'>&#9632;</span> Lower enrollment than expected<br>
+            <span style='color:#B2182B;'>&#9632;</span> Higher enrollment than expected
+            </div>",
+    position = "topright"
+  )
+```
+
+### Internet Access and Library Locations
+
+This map shows the share of households with no internet access in 
+each tract, with Chicago Public Library branch locations overlaid. 
+Tracts with the highest no-internet rates are concentrated on the 
+south and west sides. Library branches are relatively evenly 
+distributed, but several high-need clusters on the far south side 
+have fewer nearby branches.
+
+```{r}
+internet_pal <- colorNumeric(palette = "PuRd", domain = chicago_tracts$no_internet_rate)
+
+leaflet(chicago_tracts |> st_transform(4326)) |>
+  addProviderTiles("CartoDB.Positron") |>
+  addPolygons(
+    fillColor = ~internet_pal(no_internet_rate),
+    fillOpacity = 0.7,
+    color = "white",
+    weight = 0.5,
+    popup = ~paste0(
+      "<b>Tract: </b>", GEOID, "<br>",
+      "<b>No Internet: </b>", round(no_internet_rate * 100, 1), "%<br>",
+      "<b>Nearest Library: </b>", nearest_library, "<br>",
+      "<b>Distance: </b>", round(library_dist_mi, 2), " miles"
+    ),
+    group = "No Internet Rate"
+  ) |>
+  addCircleMarkers(
+    data = libraries |> st_transform(4326),
+    radius = 5,
+    color = "black",
+    fillColor = "purple",
+    fillOpacity = 0.9,
+    weight = 1,
+    popup = ~paste0("<b>", branch_, "</b><br>", address),
+    group = "Library Branches"
+  ) |>
+  addLegend(
+    position = "bottomright",
+    pal = internet_pal,
+    values = ~no_internet_rate,
+    title = "Households with<br>No Internet",
+    labFormat = labelFormat(
+      transform = function(x) round(x * 100, 0),
+      suffix = "%"
+    )
+  ) |>
+  addLayersControl(
+    overlayGroups = c("No Internet Rate", "Library Branches"),
+    options = layersControlOptions(collapsed = FALSE)
+  ) |>
+  addControl(
+    html = "<div style='background:white; padding:8px; font-size:12px; border-radius:4px;'>
+            <span style='color:purple;'>&#11044;</span> Library Branch
+            </div>",
+    position = "bottomleft"
+  )
+```
+
+### Distance to Nearest Library Branch
+
+This map shows the straight-line distance from each tract's 
+centroid to the nearest Chicago Public Library branch. Most of 
+Chicago is within one mile of a library. The far south side and 
+the area around O'Hare have the longest distances, but the 
+regression results show that this distance does not significantly 
+predict SNAP enrollment after controlling for poverty and internet 
+access.
+
+```{r}
+dist_pal <- colorNumeric(palette = "YlGnBu", domain = chicago_tracts$library_dist_mi)
+
+leaflet(chicago_tracts |> st_transform(4326)) |>
+  addProviderTiles("CartoDB.Positron") |>
+  addPolygons(
+    fillColor = ~dist_pal(library_dist_mi),
+    fillOpacity = 0.7,
+    color = "white",
+    weight = 0.5,
+    popup = ~paste0(
+      "<b>Tract: </b>", GEOID, "<br>",
+      "<b>Nearest Library: </b>", nearest_library, "<br>",
+      "<b>Distance: </b>", round(library_dist_mi, 2), " miles"
+    )
+  ) |>
+  addCircleMarkers(
+    data = libraries |> st_transform(4326),
+    radius = 4,
+    color = "black",
+    fillColor = "red",
+    fillOpacity = 0.9,
+    weight = 1,
+    popup = ~paste0("<b>", branch_, "</b><br>", address)
+  ) |>
+  addLegend(
+    position = "bottomright",
+    pal = dist_pal,
+    values = ~library_dist_mi,
+    title = "Distance to Nearest<br>Library (miles)"
+  )
+```
+
+## Conclusion
+Through this project, we can establish that there is a statistically significant spatial relationship between internet access and SNAP enrollment patterns that persists after controlling for poverty, and that a spatial error model fits the data much better than OLS, meaning neighborhood-level factors beyond what is presented in this model are at play.
+
+An interesting finding worth noting is that tracts with less internet access actually have higher enrollment, not lower. This was unexpected. Caseworkers and community organizations are likely already reaching the most disconnected areas, masking the digital barrier at the neighborhood level. The barrier may still exist for individual households, but tract-level data can't isolate it.
+
+Additionally, these residual maps could serve as a targeting tool. The tracts 
+where enrollment falls below what poverty levels predict are the tracts where eligible households are not applying. If the city or state wanted to prioritize outreach, through potentially sending caseworkers, hosting in-person enrollment events, or placing application kiosks, the tracts highlighted in this analysis are where those resources would reach the most underserved households.
